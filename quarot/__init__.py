@@ -8,7 +8,7 @@ import quarot._CUDA
 
 __all__ = [ 
            "matmul", #int-4 matmul
-           "sym_quant", "sym_dequant", "PackedQuantizedTensor", # Quantization
+           "sym_quant", "sym_quant_half", "sym_dequant", "PackedQuantizedTensor", # Quantization
 ]
 
 class ShapeHandler:
@@ -45,6 +45,12 @@ def sym_quant(x, scale):
     x, x_shape_excl_last = flatten_last_dim_and_return_shape(x)
     return quarot._CUDA.sym_quant(x, scale.view(-1)).view(*x_shape_excl_last, -1)
 
+def sym_quant_half(x, scale):
+    assert x.dtype == scale.dtype == torch.float16
+    x, x_shape_excl_last = flatten_last_dim_and_return_shape(x)
+    #print(x.size(), x_shape_excl_last)
+    return quarot._CUDA.sym_quant_half(x, scale.view(-1)).view(*x_shape_excl_last, -1)
+
 def sym_dequant(q, scale_row, scale_col, bits=32):
     assert q.dtype == torch.int32
     assert scale_row.dtype == scale_col.dtype == torch.float16
@@ -58,6 +64,26 @@ class PackedQuantizedTensor:
                  scales_x: torch.Tensor):
         self.quantized_x = quantized_x
         self.scales_x = scales_x
+
+    def size(self):
+        return self.quantized_x.size()
+    
+    @property
+    def device(self):
+        return self.quantized_x.device
+    
+    @property
+    def dtype(self):
+        return self.quantized_x.dtype
+
+
+class PackedNUQuantizedTensor:
+    def __init__(self, 
+                 quantized_x: torch.Tensor, 
+                 scales_x: torch.Tensor):
+        self.quantized_x = quantized_x
+        self.scales_x = scales_x
+        self.min_x = scales_x.clone() * (-8)
 
     def size(self):
         return self.quantized_x.size()

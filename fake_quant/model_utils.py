@@ -5,10 +5,14 @@ import utils
 import os
 import logging
 
+import rotated_llama
+
 OPT_MODEL = transformers.models.opt.modeling_opt.OPTForCausalLM
 OPT_LAYER = transformers.models.opt.modeling_opt.OPTDecoderLayer
 LLAMA_MODEL = transformers.models.llama.modeling_llama.LlamaForCausalLM
 LLAMA_LAYER = transformers.models.llama.modeling_llama.LlamaDecoderLayer
+ROTATED_LLAMA_MODEL = rotated_llama.RotatedLlamaForCausalLM
+ROTATED_LLAMA_LAYER = rotated_llama.RotatedLlamaDecoderLayer
 
 
 def model_type_extractor(model):
@@ -16,6 +20,8 @@ def model_type_extractor(model):
         return LLAMA_MODEL
     elif isinstance(model, OPT_MODEL):
         return OPT_MODEL
+    elif isinstance(model, ROTATED_LLAMA_MODEL):
+        return ROTATED_LLAMA_MODEL
     else:
         raise ValueError(f'Unknown model type {model}')
 
@@ -24,7 +30,7 @@ def skip(*args, **kwargs):
     pass
 
 def get_rope_function_name(model):
-    if isinstance(model, LLAMA_MODEL):
+    if isinstance(model, (LLAMA_MODEL, ROTATED_LLAMA_MODEL)):
         return "apply_rotary_pos_emb"
     raise NotImplementedError
 
@@ -32,19 +38,20 @@ def get_rope_function_name(model):
 def get_layers(model):
     if isinstance(model, OPT_MODEL):
         return model.model.decoder.layers
-    if isinstance(model, LLAMA_MODEL):
+    if isinstance(model, (LLAMA_MODEL, ROTATED_LLAMA_MODEL)):
         return model.model.layers
     raise NotImplementedError
 
 
-def get_llama(model_name, hf_token):
+def get_llama(model_name, hf_token, dtype):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+    model = transformers.LlamaForCausalLM.from_pretrained(model_name,
                                                           use_auth_token=hf_token,
-                                                          low_cpu_mem_usage=True)
-    model.seqlen = 2048
+                                                          low_cpu_mem_usage=True,
+                                                          torch_dtype=dtype)
+    model.seqlen = 2048#1024
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
@@ -62,10 +69,10 @@ def get_opt(model_name):
 
 
 def get_model(
-    model_name, hf_token=None
+    model_name, hf_token=None, dtype='auto'
 ):
-    if 'llama' in model_name:
-        return get_llama(model_name, hf_token)
+    if 'llama' in model_name or 'Llama' in model_name:
+        return get_llama(model_name, hf_token, dtype)
     elif 'opt' in model_name:
         return get_opt(model_name)
     else:
@@ -77,12 +84,14 @@ def get_model_type(model):
         model_type = OPT_MODEL
     elif isinstance(model, LLAMA_MODEL):
         model_type = LLAMA_MODEL
+    elif isinstance(model, ROTATED_LLAMA_MODEL):
+        model_type = ROTATED_LLAMA_MODEL
     else:
         raise ValueError(f'Unknown model type {model}')
     return model_type
 
 def get_embeddings(model, model_type) -> list[torch.nn.Module]:
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         return [model.model.embed_tokens]
     elif model_type == OPT_MODEL:
         return [model.model.decoder.embed_tokens, model.model.decoder.embed_positions]
@@ -91,7 +100,7 @@ def get_embeddings(model, model_type) -> list[torch.nn.Module]:
 
 
 def get_transformer_layers(model, model_type):
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         return [layer for layer in model.model.layers]
     elif model_type == OPT_MODEL:
         return [layer for layer in model.model.decoder.layers]
@@ -100,7 +109,7 @@ def get_transformer_layers(model, model_type):
 
 
 def get_lm_head(model, model_type):
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         return model.lm_head
     elif model_type == OPT_MODEL:
         return model.lm_head
@@ -108,7 +117,7 @@ def get_lm_head(model, model_type):
         raise ValueError(f'Unknown model type {model_type}')
 
 def get_pre_head_layernorm(model, model_type):
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         pre_head_layernorm = model.model.norm
         assert isinstance(pre_head_layernorm,
                           transformers.models.llama.modeling_llama.LlamaRMSNorm)
@@ -121,7 +130,7 @@ def get_pre_head_layernorm(model, model_type):
 
 def get_mlp_bottleneck_size(model):
     model_type = get_model_type(model)
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         return model.config.intermediate_size
     elif model_type == OPT_MODEL:
         return model.config.ffn_dim
@@ -196,7 +205,7 @@ def capture_layer_io(model_type, layer, layer_input):
 
     handles = []
 
-    if model_type == LLAMA_MODEL:
+    if model_type in [LLAMA_MODEL, ROTATED_LLAMA_MODEL]:
         captured_inputs = {
             'k_proj': [],  # q_proj, v_proj has the same input as k_proj
             'o_proj': [],

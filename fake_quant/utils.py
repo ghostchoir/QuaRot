@@ -12,12 +12,15 @@ from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory
 
 supported_models = [
+            'meta-llama/Llama-2-7b',
             'meta-llama/Llama-2-7b-hf',
             'meta-llama/Llama-2-13b-hf',
             'meta-llama/Llama-2-70b-hf',
             'meta-llama/Meta-Llama-3-8B',
             'meta-llama/Meta-Llama-3-70B',
-            'facebook/opt-125m'
+            'facebook/opt-125m',
+            '/mnt/cephfs/echoi/models/Llama-2-7b-hf',
+            '/ceph/echoi/models/Llama-2-7b-hf'
             ]
 supported_datasets = ['wikitext2', 'ptb', 'c4']
 
@@ -68,7 +71,7 @@ def config_logging(log_file, level=logging.INFO):
     logging.basicConfig(level=level, handlers=[console_handler, file_handler])
 
 
-def parser_gen():
+def parser_gen(cmd=None):
     parser = argparse.ArgumentParser()
 
     # General Arguments
@@ -87,11 +90,18 @@ def parser_gen():
                         help='''Rotate the moodel. This will include online rotation for down-projection and
                         out-projection. Note that this does not apply rotation to the K/Q and they will be rotated
                         if we want to quantize the Keys''')
-    parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
+    parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random', 'learnable'])
     parser.add_argument('--rotation_seed', type=int, default=-1,
                         help='Random Seed for generating random matrix!!')
     parser.add_argument('--fp32_had', action=argparse.BooleanOptionalAction, default=False,
                         help='Apply Hadamard rotation in FP32 (default: False)')
+    
+    
+    # SpinQuant Arguments
+    parser.add_argument('--learn_r1', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--learn_r2', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--momentum', type=float, default=0.0)
+    parser.add_argument('--prefix_r', type=str, default='')
 
     # Activation Quantization Arguments
     parser.add_argument('--a_bits', type=int, default=16,
@@ -187,7 +197,10 @@ def parser_gen():
         help="Distribute the model on multiple GPUs for evaluation.",
     )
 
-    args = parser.parse_args()
+    if cmd is not None:
+        args = parser.parse_args(args=cmd)
+    else:
+        args = parser.parse_args()
     if args.lm_eval:
         from lm_eval import tasks
         from lm_eval import utils as lm_eval_utils
@@ -249,17 +262,23 @@ def cleanup_memory(verbos=True) -> None:
                 f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
             )
 
-def distribute_model(model) -> None:
+def distribute_model(model, max_memory=None) -> None:
     """Distribute the model across available GPUs. NB: only implemented for Llama-2."""
-    no_split_module_classes = ['LlamaDecoderLayer']
+    no_split_module_classes = ['LlamaDecoderLayer', 'RotatedLlamaDecoderLayer']
     max_memory = get_balanced_memory(
         model,
+        max_memory=max_memory,
         no_split_module_classes=no_split_module_classes,
+        #low_zero=True
     )
 
+    #print(max_memory)
+
     device_map = infer_auto_device_map(
-        model, max_memory=max_memory, no_split_module_classes=no_split_module_classes
+        model, max_memory=max_memory, no_split_module_classes=no_split_module_classes, verbose=False
     )
+
+    #print(device_map)
 
     dispatch_model(
         model,

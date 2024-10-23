@@ -137,7 +137,7 @@ class GPTQ:
         
         
 @torch.no_grad()
-def gptq_fwrd(model, dataloader, dev, args):
+def gptq_fwrd(model, dataloader, dev, args, layer_types=[torch.nn.Linear]):
     '''
     From GPTQ repo 
     TODO: Make this function general to support both OPT and LLaMA models
@@ -150,6 +150,8 @@ def gptq_fwrd(model, dataloader, dev, args):
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
+    if hasattr(model.model, "rotary_emb"):
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -195,7 +197,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     for i in range(len(layers)):
         print(f'\nLayer {i}:', flush=True, end=' ')
         layer = layers[i].to(dev)
-        full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
+        full = quant_utils.find_qlayers(layer, layers=layer_types)
         for names in sequential:
             subset = {n: full[n] for n in names}
 

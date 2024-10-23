@@ -17,7 +17,7 @@ def main():
         wandb.config.update(args)
         
     transformers.set_seed(args.seed)
-    model = model_utils.get_model(args.model, args.hf_token)
+    model = model_utils.get_model(args.model, args.hf_token, dtype=torch.bfloat16)
     model.eval()
     
     
@@ -36,7 +36,7 @@ def main():
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
                 qlayers[name].fp32_had = args.fp32_had
-            if 'o_proj' in name:
+            if 'o_proj' in name and args.rotate_mode != 'learnable':
                 had_K, K = hadamard_utils.get_hadK(model.config.num_attention_heads)
                 qlayers[name].online_partial_had = True
                 qlayers[name].had_K = had_K
@@ -57,7 +57,7 @@ def main():
             model.load_state_dict(save_dict["model"])
             
         elif not args.w_rtn: # GPTQ Weight Quantization
-            assert "llama" in args.model, "Only llama is supported for GPTQ!"
+            # assert "llama" in args.model, "Only llama is supported for GPTQ!"
             
             trainloader = data_utils.get_loaders(
                 args.cal_dataset, nsamples=args.nsamples,
@@ -79,7 +79,8 @@ def main():
     if args.a_bits < 16 or args.v_bits < 16:
         qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         down_proj_groupsize = -1
-        if args.a_groupsize > 0 and "llama" in args.model:
+        flag = True if 'Llama' in args.model or 'llama' in args.model else False
+        if args.a_groupsize > 0 and flag:
             down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
         
         for name in qlayers:            
@@ -87,13 +88,21 @@ def main():
             layer_groupsize = args.a_groupsize
             layer_a_sym = not(args.a_asym)
             layer_a_clip = args.a_clip_ratio
+
+            num_heads = model.config.num_attention_heads
+            model_dim = model.config.hidden_size
+            head_dim = model_dim // num_heads
+
             
             if 'v_proj' in name and args.v_bits < 16: #Set the v_proj precision
+                v_groupsize = head_dim
                 qlayers[name].out_quantizer.configure(bits=args.v_bits,
-                                              groupsize=args.v_groupsize,
+                                              groupsize= v_groupsize, # args.v_groupsize,
                                               sym=not(args.v_asym),
                                               clip_ratio=args.v_clip_ratio)
-            
+            if 'o_proj' in name:
+                layer_groupsize = head_dim
+                
             if 'lm_head' in name: #Skip lm_head quantization   
                 layer_input_bits = 16
             
@@ -122,7 +131,8 @@ def main():
                             rope_function_name, 
                             config=model.config,
                             **k_quant_config)
-        
+                
+
     # Evaluating on dataset
     testloader = data_utils.get_loaders(
             args.eval_dataset,

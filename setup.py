@@ -56,6 +56,7 @@ if __name__ == '__main__':
                     'quarot/kernels/gemm.cu',
                     'quarot/kernels/quant.cu',
                     'quarot/kernels/flashinfer.cu',
+                    'quarot/kernels/w2a4_gemm.cu'
                 ],
                 include_dirs=[
                     os.path.join(setup_dir, 'quarot/kernels/include'),

@@ -4,6 +4,7 @@
 #include <gemm.h>
 #include <quant.h>
 #include <flashinfer.h>
+#include <w2a4_gemm.h>
 
 
 torch::Tensor matmul(const torch::Tensor &A, const torch::Tensor &B)
@@ -39,6 +40,25 @@ torch::Tensor sym_quant(const torch::Tensor &x, const torch::Tensor &scale)
     auto q = torch::empty({rows, colsDst},torch::dtype(torch::kUInt8).device(x.device()));
 
     sym_quant_host((half*)x.data_ptr(), (half*)scale.data_ptr(), rows, colsSrc, colsDst, q.data_ptr<Int4Storage>());
+
+    return q;
+}
+
+torch::Tensor sym_quant_half(const torch::Tensor &x, const torch::Tensor &scale)
+{
+    torch::checkAllContiguous("sym_quant_half", {{x,     "x",     0},
+                                                      {scale, "scale", 1}});
+    torch::checkDeviceType("sym_quant_half", {x, scale}, at::DeviceType::CUDA);
+
+    torch::checkSameGPU("sym_quant_half", {x, "x", 0}, {scale, "scale", 1});
+    torch::checkSize("sym_quant_half", torch::TensorArg{scale, "scale", 1}, 0, x.size(0));
+    uint32_t rows = x.size(0);
+    uint32_t colsSrc = x.size(1);
+    uint32_t colsDst = cdiv(colsSrc, kElementsPerVector);
+
+    auto q = torch::empty({rows, colsDst}, torch::dtype(torch::kHalf).device(x.device()));
+
+    sym_quant_half_host((half*)x.data_ptr(), (half*)scale.data_ptr(), rows, colsSrc, colsDst, (half*)q.data_ptr());
 
     return q;
 }
@@ -373,7 +393,30 @@ void append_kv_f16(torch::Tensor kv_data, torch::Tensor kv_param,
       page_size, batch_size);
 }
 
+void construct_LUT(
+    torch::Tensor What,    // [H, N, 4] BF16
+    torch::Tensor Delta,   // [T] BF16
+    torch::Tensor Xmin,    // [T] BF16
+    torch::Tensor LUT,     // [T, H, N, 4, 2] BF16
+    int T,
+    int H,
+    int N
+) {
+  construct_LUT_launcher(What, Delta, Xmin, LUT, T, H, N);
+}
 
+void gemm_with_LUT(
+    torch::Tensor Wq,      // [H, N, D/2] INT8
+    torch::Tensor LUT,     // [T, H, N, 4, 2] BF16
+    torch::Tensor Xq,      // [T, N, D] BF16
+    torch::Tensor O,       // [T, H] BF16
+    int T,
+    int H,
+    int N,
+    int D
+) {
+  gemm_with_LUT_launcher(Wq, LUT, Xq, O, T, H, N, D);
+}
 
 //====== pybind ======
 
@@ -391,6 +434,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m
           py::arg("A"), py::arg("B"));
 
     m.def("sym_quant", &sym_quant,
+          "input: (src: torch.Tensor(M x N, FP16, CUDA), scale: "
+          "torch.Tensor(M x 1, FP16, CUDA))"
+          "bits: int\n"
+          "output: torch.Tensor(M x ceil(N / 2), UINT8, CUDA)\n"
+          "output = int4Packing(int4Rounding(source / scale)\n",
+          py::arg("x"), py::arg("scale"));
+    
+    m.def("sym_quant_half", &sym_quant_half,
           "input: (src: torch.Tensor(M x N, FP16, CUDA), scale: "
           "torch.Tensor(M x 1, FP16, CUDA))"
           "bits: int\n"
@@ -418,5 +469,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m
     m.def("batch_decode_f16", &batch_decode_f16, "");
     m.def("init_kv_f16", &init_kv_f16, "");
     m.def("append_kv_f16", &append_kv_f16, ""); 
-
+    m.def("construct_LUT", &construct_LUT, "Construct LUT (CUDA)");
+    m.def("gemm_with_LUT", &gemm_with_LUT, "GEMM with LUT (CUDA)");
 }

@@ -13,6 +13,16 @@ void sym_quant_host(
 );
 
 
+void sym_quant_half_host(
+        const half *x,
+        const half *scale,
+        uint32_t rows,
+        uint32_t colsSrc,
+        uint32_t colsDst,
+        half *q
+);
+
+
 void sym_dequant_host(
         const int32_t *q,
         const half *scale_row,

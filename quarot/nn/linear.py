@@ -77,3 +77,88 @@ class Linear4bit(torch.nn.Module):
                 int_module.bias.copy_(module.bias)
         
         return int_module
+
+
+class Linear2bit(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=False, dtype=torch.float16, group_size=128):
+        '''
+        Symmetric 4-bit Linear Layer.
+        '''
+        super().__init__()
+        self.in_features = in_features # W
+        self.out_features = out_features # H
+        self.dtype = dtype
+        self.group_size = group_size
+        #self.register_buffer('weight_scales',
+        #                     torch.zeros((self.out_features, 1), requires_grad=False))
+        self.register_buffer(
+            'Wq',
+            (torch.randint(
+                1, 7,
+                (self.out_features, group_size, self.in_features // group_size // 2),
+                dtype=torch.int8,
+                requires_grad=False)))
+        What = torch.zeros((self.out_features, group_size, 4), requires_grad=False)
+        self.register_buffer('What', What)
+        
+        
+        if bias:                                                        
+            self.register_buffer('bias', torch.zeros((self.out_features), dtype=dtype))
+        else:
+            self.bias = None
+        
+    def forward(self, x):
+        #if torch.cuda.current_device() != x.device:
+        #    torch.cuda.set_device(x.device)
+        # H: out_features / W: in_features
+        
+        assert type(x) == quarot.PackedNUQuantizedTensor #Quantized input is given
+        Xq, Delta, Xmin = x.quantized_x, x.scales_x, x.min_x #
+        
+        #print(Xq.dtype, Delta.dtype, Xmin.dtype)
+        H, W = self.out_features, self.in_features
+        T = Xq.size(0)
+        N = W // self.group_size
+        D = self.group_size
+        
+        #O = torch.zeros((T, H), requires_grad=False, dtype=self.dtype)
+        quarot._CUDA.construct_LUT(self.What, Delta, Xmin, self.LUT, T, H, N)
+        
+        #quarot._CUDA.gemm_with_LUT(self.Wq, self.LUT, Xq, self.O, T, H, N, D)
+        
+        return self.O
+        #shape_handler = ShapeHandler(quantized_x)
+        #quantized_x = shape_handler.flatten(quantized_x)
+        #x = quarot.matmul(x, self.weight)
+        #out = shape_handler.unflatten(
+        #    quarot.sym_dequant(int_result, scales_x, self.weight_scales))
+        #if self.bias is not None:
+        #    return quarot.sym_dequant(x, scales_x, self.weight_scales) + self.bias
+        #else:
+        #    return quarot.sym_dequant(x, scales_x, self.weight_scales)
+        
+    
+    @staticmethod
+    def from_float(module: torch.nn.Linear, weight_scales=None, group_size=128, LUT=None, O=None,):
+        '''
+        Generate a new Linear4bit module from a FP16 Linear module.
+        The weight matrix should have the same shape as the weight matrix of the FP16 Linear module and rounded using torch.round()
+        routine. We will convert it to subByte representation and save it in the int_weight buffer.
+        '''
+        weight_matrix = module.weight.data
+        
+        
+        int_module = Linear2bit(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            dtype=weight_matrix.dtype,
+            group_size=group_size).to(weight_matrix.dtype)
+        
+        if LUT is not None:
+            int_module.register_buffer('LUT', LUT)
+        
+        if O is not None:
+            int_module.register_buffer('O', O)
+        
+        return int_module

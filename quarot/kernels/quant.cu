@@ -45,6 +45,40 @@ void sym_quantize_f16_i4_kernel(
 }
 
 
+__global__
+void sym_quantize_f16_i4_half_kernel(
+        const half *__restrict__ x,
+        const half *__restrict__ scale,
+        uint32_t rows,
+        uint32_t colsSrc,
+        uint32_t colsDst,
+        half *__restrict__ q
+)
+{
+    uint32_t row = threadIdx.y + blockIdx.y * blockDim.y;
+    uint32_t colDst = threadIdx.x + blockIdx.x * blockDim.x;
+    if (row >= rows || colDst * kElementsPerVector >= colsSrc)
+    {
+        return;
+    }
+    half storage = __float2half_rn(0.0f);
+    uint32_t id = colDst * kElementsPerVector + row * colsSrc;
+#pragma unroll
+    for (int i = 0; i < kElementsPerVector; ++i)
+    {
+        bool safe = (colDst * kElementsPerVector + i) < colsSrc;
+        if (safe)
+        {
+            half data = __hdiv(x[id + i], scale[row]);
+
+            storage = __int2half_rn(clamp(__half2int_rn(data), qmin, qmax));
+        }
+    }
+
+    q[colDst + row * colsDst] = storage;
+}
+
+
 void sym_quant_host(
         const half *x,
         const half *scale,
@@ -58,6 +92,21 @@ void sym_quant_host(
     dim3 block{std::min<uint32_t>(colsDst, 32), std::min<uint32_t>(rows, 16)};
     dim3 grid{cdiv(colsDst, block.x), cdiv(rows, block.y)};
     sym_quantize_f16_i4_kernel<<<grid, block>>>(x, scale, rows, colsSrc, colsDst, q);
+}
+
+
+void sym_quant_half_host(
+        const half *x,
+        const half *scale,
+        uint32_t rows,
+        uint32_t colsSrc,
+        uint32_t colsDst,
+        half *q
+)
+{
+    dim3 block{std::min<uint32_t>(colsDst, 32), std::min<uint32_t>(rows, 16)};
+    dim3 grid{cdiv(colsDst, block.x), cdiv(rows, block.y)};
+    sym_quantize_f16_i4_half_kernel<<<grid, block>>>(x, scale, rows, colsSrc, colsDst, q);
 }
 
 

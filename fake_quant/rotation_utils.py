@@ -1,3 +1,6 @@
+import numpy as np
+from scipy.stats import special_ortho_group
+
 import model_utils
 import torch
 import typing
@@ -7,6 +10,7 @@ import tqdm, math
 import quant_utils
 from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
 from fast_hadamard_transform import hadamard_transform
+
 
 def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
     """
@@ -24,7 +28,8 @@ def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[to
                 linear.bias = torch.nn.Parameter(torch.zeros(linear.out_features, dtype=torch.float64))
             linear.bias.data = linear.bias.data.double() + torch.matmul(W_, layernorm.bias.double())
             linear.bias.data = linear.bias.data.to(linear_dtype)
-            
+
+
 def bake_mean_into_linear(linear: torch.nn.Linear) -> None:
     """
     This function takes a linear layer and subtracts the means from the
@@ -40,8 +45,7 @@ def bake_mean_into_linear(linear: torch.nn.Linear) -> None:
         linear.bias.data = b_ - b_.mean()
         linear.bias.data = linear.bias.data.to(linear_dtype)
 
-         
-            
+
 def fuse_layer_norms(model):
     
     model_type = model_utils.get_model_type(model)
@@ -59,7 +63,7 @@ def fuse_layer_norms(model):
     for layer in layers:
         
         # fuse the input layernorms into the linear layers
-        if model_type == model_utils.LLAMA_MODEL:
+        if model_type in [model_utils.LLAMA_MODEL, model_utils.ROTATED_LLAMA_MODEL]:
             fuse_ln_linear(layer.post_attention_layernorm, [layer.mlp.up_proj, layer.mlp.gate_proj])    
             fuse_ln_linear(layer.input_layernorm, [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
         elif model_type == model_utils.OPT_MODEL:
@@ -79,11 +83,11 @@ def fuse_layer_norms(model):
     
     model_utils.replace_modules(
         model,
-        transformers.models.llama.modeling_llama.LlamaRMSNorm if model_type == model_utils.LLAMA_MODEL else torch.nn.LayerNorm,
+        transformers.models.llama.modeling_llama.LlamaRMSNorm if model_type in [model_utils.LLAMA_MODEL, model_utils.ROTATED_LLAMA_MODEL] else torch.nn.LayerNorm,
         lambda _: model_utils.RMSN(model.config.hidden_size),
         replace_layers=False,
     )
-    
+
 
 def random_orthogonal_matrix(size, device):
     """
@@ -103,16 +107,31 @@ def random_orthogonal_matrix(size, device):
     q, r = torch.linalg.qr(random_matrix)
     q *= torch.sign(torch.diag(r)).unsqueeze(0)
     return q
+    #q = special_ortho_group.rvs(size)#.astype(np.float32)
+    #q = torch.from_numpy(q).to(device=device)
+    #return q
+
+
+def random_special_orthogonal_matrix(size, device):
+    torch.cuda.empty_cache()
+    q = special_ortho_group.rvs(size)#.astype(np.float32)
+    q = torch.from_numpy(q).to(device=device)
+    return q
+
 
 def get_orthogonal_matrix(size, mode, device=utils.DEV):
-    if mode == 'random':
+    if mode in ['random', 'qr']:
         return random_orthogonal_matrix(size, device)
+    elif mode == 'so':
+        return random_special_orthogonal_matrix(size, device)
     elif mode == 'hadamard':
         return random_hadamard_matrix(size, device)
+    elif mode == 'learnable':
+        Q = torch.load('Q1.pt', map_location=device).data.to(dtype=torch.float64).requires_grad_(False)
+        return Q
     else:
         raise ValueError(f'Unknown mode {mode}')
 
-    
 
 def rotate_embeddings(model, Q: torch.Tensor) -> None:
     # Rotate the embeddings.
@@ -122,13 +141,14 @@ def rotate_embeddings(model, Q: torch.Tensor) -> None:
         W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
-    
+
 def rotate_attention_inputs(layer, Q, model_type) -> None:
     # Rotate the WQ, WK and WV matrices of the self-attention layer.
     for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
         dtype = W.weight.dtype
         W_ = W.weight.to(device=utils.DEV, dtype=torch.float64)
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
 
 def rotate_attention_output(layer, Q, model_type) -> None:
     # Rotate output matrix of the self-attention layer.
@@ -146,6 +166,7 @@ def rotate_attention_output(layer, Q, model_type) -> None:
         b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
+
 def rotate_mlp_input(layer, Q, model_type):
     # Rotate the MLP input weights.
     if model_type == model_utils.LLAMA_MODEL:
@@ -158,7 +179,8 @@ def rotate_mlp_input(layer, Q, model_type):
         dtype = W.weight.dtype
         W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
-    
+
+
 def rotate_mlp_output(layer, Q, model_type):
     # Rotate the MLP output weights and bias.
     if model_type == model_utils.LLAMA_MODEL:
@@ -174,6 +196,7 @@ def rotate_mlp_output(layer, Q, model_type):
     if W.bias is not None:
         b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
 
 def matmul_hadU_cuda_had(X, hadK, transpose=False):
     '''
@@ -191,8 +214,8 @@ def matmul_hadU_cuda_had(X, hadK, transpose=False):
     input = X.float().cuda().view(-1, K, n // K)
     input = hadamard_transform(input.contiguous(), scale=1/math.sqrt(n))
     input = hadK.to(input.device).to(input.dtype) @ input 
-    return input.to(X.device).to(X.dtype).reshape(
-        X.shape) 
+    return input.to(X.device).to(X.dtype).reshape(X.shape) 
+
 
 def rotate_faster_down_proj(layer, model_type, hardK):
     from fast_hadamard_transform import hadamard_transform
@@ -213,7 +236,8 @@ def rotate_head(model, Q: torch.Tensor) -> None:
     W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
     W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
-def rotate_ov_proj(layer, model_type, head_num, head_dim):
+
+def rotate_ov_proj(layer, model_type, head_num, head_dim, rotate_mode='hadamard', Q2=None):
     v_proj = layer.self_attn.v_proj
     if model_type == model_utils.LLAMA_MODEL:
         o_proj = layer.self_attn.o_proj
@@ -222,14 +246,31 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim):
     else:
         raise ValueError(f'Unknown model type {model_type}')
     
-    apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
-    apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+    if rotate_mode in ['random', 'hadamard']:
+        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+    else:
+        Wv = v_proj.weight.data
+        Wo = o_proj.weight.data
+        
+        dtype = Wv.dtype
+        
+        Wo_ = Wo.to(device=utils.DEV, dtype=torch.float64).reshape(Wo.size(0), head_num, -1)
+        Wv_ = Wv.to(device=utils.DEV, dtype=torch.float64).reshape(head_num, -1, Wv.size(1))
+        
+        o_proj.weight.data = torch.einsum('inh,hj->inj', Wo_, Q2).reshape(Wo.size(0), -1).to(dtype=dtype)
+        v_proj.weight.data = torch.einsum('ih,nhj->nij', Q2.T, Wv_).reshape(Wv.size(0), -1).to(dtype=dtype)
+        
 
 
 @torch.inference_mode()
 def rotate_model(model, args):
-    Q = get_orthogonal_matrix(model.config.hidden_size,
-                                                args.rotate_mode)
+    if args.rotate_mode == 'learnable':
+        prefix = args.prefix_r + '_' if len(args.prefix_r) > 0 else ''
+        Q = torch.load(f'rotations/{prefix}R1.pt', map_location='cpu').data.to(utils.DEV, dtype=torch.float64)
+    else:
+        Q = get_orthogonal_matrix(model.config.hidden_size,
+                                                    args.rotate_mode)
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
@@ -243,17 +284,24 @@ def rotate_model(model, args):
     layers = model_utils.get_transformer_layers(model, 
                                                 model_type=model_type)
     for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="Rotating")):
+        
+        if args.rotate_mode == 'learnable':
+            #prefix = args.prefix_r + '_' if len(args.prefix_r) > 0 else ''
+            Q2 = torch.load(f'rotations/{prefix}R2_{idx}.pt', map_location='cpu').data.to(utils.DEV, dtype=torch.float64)
+        else:
+            Q2 = None
         rotate_attention_inputs(layers[idx], Q, model_type)
         rotate_attention_output(layers[idx], Q, model_type)
         rotate_mlp_input(layers[idx], Q, model_type)
         rotate_mlp_output(layers[idx], Q, model_type)
-        rotate_ov_proj(layers[idx], model_type, num_heads, head_dim)
+        rotate_ov_proj(layers[idx], model_type, num_heads, head_dim, args.rotate_mode, Q2)
 
 
 @torch.inference_mode
 def online_rotate(module, inp):
     x = torch.nn.functional.linear(inp[0], module.Q)
     return (x,) + inp[1:]
+
 
 def register_online_rotation(module, Q:torch.Tensor):
     assert not hasattr(module, 'Q')
@@ -283,7 +331,7 @@ class QKRotationWrapper(torch.nn.Module):
             self.k_sym = kwargs['k_sym']
             self.k_clip_ratio = kwargs['k_clip_ratio']
             self.k_quantizer.configure(bits=self.k_bits, groupsize=-1, #we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                                   sym=self.k_sym, clip_ratio=self.k_clip_ratio)
+                                        sym=self.k_sym, clip_ratio=self.k_clip_ratio)
 
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)
@@ -307,7 +355,6 @@ class QKRotationWrapper(torch.nn.Module):
         return q, k
 
 
-
 def add_qk_rotation_wrapper_after_function_call_in_forward(module, function_name, *args, **kwargs):
     '''
     This function adds a rotation wrapper after the output of a function call in forward. 
@@ -317,6 +364,9 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(module, function_name
     import functools
     attr_name = f"{function_name}_qk_rotation_wrapper"
     assert not hasattr(module, attr_name)
-    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(module, "forward",
-                                                                    function_name, functools.partial(QKRotationWrapper, *args, **kwargs))
+    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(
+        module,
+        "forward",
+        function_name,
+        functools.partial(QKRotationWrapper, *args, **kwargs))
     setattr(module, attr_name, wrapper)

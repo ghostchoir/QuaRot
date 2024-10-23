@@ -5,6 +5,9 @@ import utils
 import hadamard_utils
 import fast_hadamard_transform
 
+from rotated_llama import RotatedLinear, RotatedOVProj
+
+
 def get_minq_maxq(bits, sym):
     if sym:
         maxq = torch.tensor(2**(bits-1)-1)
@@ -77,6 +80,7 @@ def unpack_i4(x: torch.Tensor):
 
     return out.view(out_shape)
 
+
 class ActQuantizer(torch.nn.Module):
 
     '''
@@ -118,6 +122,7 @@ class ActQuantizer(torch.nn.Module):
         self.clip_ratio = clip_ratio
         assert self.clip_ratio <= 1 and self.clip_ratio > 0, 'Clip ratio should be in (0, 1]'
 
+    @torch.no_grad()
     def find_params_per_token_groupwise(self, x):
         init_shape = x.shape
         reshaped_x = x.reshape(-1, x.shape[-2], x.shape[-1] // self.groupsize, self.groupsize)
@@ -140,6 +145,7 @@ class ActQuantizer(torch.nn.Module):
         self.scale = self.scale.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
         self.zero = self.zero.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
 
+    @torch.no_grad()
     def find_params(self, x):
         if self.bits == 16:
             return
@@ -177,6 +183,7 @@ class ActQuantizer(torch.nn.Module):
             self.scale = self.scale.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
             self.zero = self.zero.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
 
+
 class ActQuantWrapper(torch.nn.Module):
     '''
         This class is a wrapper for the activation quantization.
@@ -213,7 +220,7 @@ class ActQuantWrapper(torch.nn.Module):
 
         return str_
 
-    def forward(self, x):
+    def forward(self, x, Q=None, Qin=None, Qout=None):
         x_dtype = x.dtype
 
         # Rotate, if needed
@@ -246,7 +253,17 @@ class ActQuantWrapper(torch.nn.Module):
             x = self.quantizer(x).to(x_dtype)
             self.quantizer.free()
 
-        x = self.module(x).to(x_dtype)
+        if isinstance(self.module, RotatedLinear):
+            x = self.module(x, Q=Q).to(x_dtype)
+        elif isinstance(self.module, RotatedOVProj):
+            # output = self.module.output
+            # if output:
+            #     x = self.module(x, Qin=Qin, Qout=Qout)
+            # else:
+            #     x = self.module(x, Qin=R2, Qout=R1)
+            x = self.module(x, Qin=Qin, Qout=Qout).to(x_dtype)
+        else:
+            x = self.module(x).to(x_dtype)
 
         if self.out_quantizer.bits < 16: #Quantize the output, if needed
             self.out_quantizer.find_params(x)
@@ -254,7 +271,6 @@ class ActQuantWrapper(torch.nn.Module):
             self.out_quantizer.free()
 
         return x
-
 
 
 class WeightQuantizer(torch.nn.Module):
@@ -363,7 +379,6 @@ class WeightQuantizer(torch.nn.Module):
         return torch.all(self.scale != 0)
 
 
-
 def add_actquant(module, name='', layers=[torch.nn.Linear,
                                           ActQuantWrapper,
                                           transformers.models.falcon.modeling_falcon.FalconLinear]):
@@ -391,6 +406,7 @@ def add_actquant(module, name='', layers=[torch.nn.Linear,
             setattr(module, attr, torch.nn.ModuleList(replaced))
     for name1, child in module.named_children():
         add_actquant(child, name + '.' + name1 if name != '' else name1, layers)
+
 
 def find_qlayers(module, layers=[torch.nn.Linear,
                                 ActQuantWrapper], name=''):
